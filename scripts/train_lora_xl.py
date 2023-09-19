@@ -15,17 +15,12 @@
 # limitations under the License.
 """Fine-tuning script for Stable Diffusion XL for text2image with support for LoRA."""
 from dataclasses import dataclass, field
-import itertools
 import logging
-import math
 import os
-import random
-import shutil
 from pathlib import Path
 from typing import Dict
 import tempfile
 from PIL import Image
-import wandb
 from collections import defaultdict
 
 import datasets
@@ -37,11 +32,8 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from torchvision import transforms
-from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -310,6 +302,8 @@ class TrainingConfig:
     sample_num_steps: int = field(
         default=20, metadata={"help": "Number of steps to sample during sampling phase"}
     )
+    # TODO Add a sample train num steps
+
     sample_batch_size: int = field(
         default=8, metadata={"help": "Batch size of sampling, during sampling phase"}
     )
@@ -419,7 +413,7 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
     )
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=training_config.gradient_accumulation_steps,
+        gradient_accumulation_steps=training_config.gradient_accumulation_steps * training_config.sample_num_steps,
         mixed_precision=training_config.mixed_precision,
         log_with=training_config.report_to,
         project_config=accelerator_project_config,
@@ -809,9 +803,21 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                 tokenizers=[tokenizer_one, tokenizer_two],
                 prompts=[""],
         )
+    #neg_prompt_embeds = neg_prompt_embeds.repeat(training_config.sample_batch_size, 1, 1)
+    #pooled_neg_prompt_embeds = pooled_neg_prompt_embeds.repeat(training_config.sample_batch_size, 1)
 
-    neg_prompt_embeds = neg_prompt_embeds.repeat(training_config.sample_batch_size, 1, 1)
-    pooled_neg_prompt_embeds = pooled_neg_prompt_embeds.repeat(training_config.sample_batch_size, 1)
+    def compute_time_ids(original_size, crops_coords_top_left):
+        # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+        target_size = (training_config.resolution, training_config.resolution)
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids])
+        add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
+        return add_time_ids
+
+    add_time_ids = torch.cat(
+        # TODO should the crop argument be zero?
+        [compute_time_ids((training_config.resolution, training_config.resolution), (0,0)) for _ in range(training_config.train_batch_size)]
+    )
 
 
     global_step = 0
@@ -823,6 +829,24 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
         last_images = []
         last_rewards = None
         last_prompts = []
+
+        # TODO should this be constructed in the inner loop or is this slow?
+        print("creating pipeline...")
+        pipeline = StableDiffusionXLPipeline(
+                vae = vae,
+                text_encoder=text_encoder_two,
+                text_encoder_2=text_encoder_two,
+                tokenizer=tokenizer_one,
+                tokenizer_2=tokenizer_two,
+                unet=unet,
+                scheduler=noise_scheduler,
+            )
+        print("done creating pipeline.")
+
+        # sample negative prompt embeddings
+
+        neg_prompt_embeds_sampling = neg_prompt_embeds.repeat(training_config.sample_batch_size, 1, 1)
+        pooled_neg_prompt_embeds_sampling = pooled_neg_prompt_embeds.repeat(training_config.sample_batch_size, 1)
 
         for i in tqdm(
             range(training_config.sample_num_batches_per_epoch),
@@ -836,39 +860,24 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
             last_prompts = prompts
 
             # encode prompts
-            prompt_ids = tokenizer_one
             prompt_embeds, pooled_prompt_embeds = encode_prompt(
                 text_encoders=[text_encoder_one, text_encoder_two],
                 tokenizers=[tokenizer_one, tokenizer_two],
                 prompts=prompts,
             )
 
-
-            # TODO should this be constructed in the inner loop or is this slow?
-            print("creating pipeline...")
-            pipeline = StableDiffusionXLPipeline(
-                    vae = vae,
-                    text_encoder=text_encoder_two,
-                    text_encoder_2=text_encoder_two,
-                    tokenizer=tokenizer_one,
-                    tokenizer_2=tokenizer_two,
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
-            print("done creating pipeline.")
-
             images, latents, log_probs = xl_pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
-                    negative_prompt_embeds=neg_prompt_embeds,
-                    negative_pooled_prompt_embeds=pooled_neg_prompt_embeds,
+                    negative_prompt_embeds=neg_prompt_embeds_sampling,
+                    negative_pooled_prompt_embeds=pooled_neg_prompt_embeds_sampling,
                     num_inference_steps=training_config.sample_num_steps,
                     guidance_scale=training_config.sample_guidance_scale,
                     eta=training_config.sample_eta,
                     output_type="pt",
-                    height=512,
-                    width=512,
+                    height=training_config.resolution,
+                    width=training_config.resolution,
                 )
 
             last_images = images
@@ -884,7 +893,6 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
 
             samples.append(
                 {
-                    "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "timesteps": timesteps,
@@ -903,17 +911,17 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, image in enumerate(last_images):
                 pil = Image.fromarray((image.cpu().to(torch.float32).numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                #pil = pil.resize((512, 512))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
-            accelerator.log(
-                {
-                    "images": [
-                        wandb.Image(os.path.join(tmpdir, f"{i}.jpg"), caption=f"{prompt} | {reward:.2f}")
-                        for i, (prompt, reward) in enumerate(zip(last_prompts, last_rewards))  # only log rewards from process 0
-                    ],
-                },
-                step=global_step,
-            )
+            if training_config.report_to == "wandb":
+                accelerator.log(
+                    {
+                        "images": [
+                            wandb.Image(os.path.join(tmpdir, f"{i}.jpg"), caption=f"{prompt} | {reward:.2f}")
+                            for i, (prompt, reward) in enumerate(zip(last_prompts, last_rewards))  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
 
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
@@ -933,8 +941,9 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
             .to(accelerator.device)
         )
 
+        # TODO reduce memory (is this enede?)
+        pipeline = None
         del samples["rewards"]
-        del samples["prompt_ids"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert total_batch_size == training_config.sample_batch_size * training_config.sample_num_batches_per_epoch
@@ -971,9 +980,15 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
             ):
                 if training_config.sample_guidance_scale:
                     # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat([neg_prompt_embeds, sample["prompt_embeds"]])
+                    embeds = torch.cat([neg_prompt_embeds.repeat(training_config.train_batch_size, 1, 1), sample["prompt_embeds"]])
+                    pooled_prompt_embeds = torch.cat([pooled_neg_prompt_embeds.repeat(training_config.train_batch_size, 1), sample['pooled_prompt_embeds']])
+                    add_time_ids_train = torch.cat([add_time_ids, add_time_ids])
                 else:
+                    pooled_prompt_embeds = sample['pooled_prompt_embeds']
                     embeds = sample["prompt_embeds"]
+                    add_time_ids_train = add_time_ids
+
+                unet_added_conditions = {"time_ids": add_time_ids_train, "text_embeds": pooled_prompt_embeds}
 
                 for j in tqdm(
                     range(num_timesteps),
@@ -983,11 +998,14 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                     disable=not accelerator.is_local_main_process,
                 ):
                     with accelerator.accumulate(unet):
+                        # TODO make sure that this unet forward pass is exactly the same as in xl pipeline 
+                        # The cfg and chunking can make it confusing
                         if training_config.sample_guidance_scale:
                             noise_pred = unet(
                                 torch.cat([sample["latents"][:, j]] * 2),
                                 torch.cat([sample["timesteps"][:, j]] * 2),
                                 embeds,
+                                added_cond_kwargs=unet_added_conditions,
                             ).sample
                             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                             noise_pred = noise_pred_uncond + training_config.sample_guidance_scale * (
@@ -998,6 +1016,7 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                                 sample["latents"][:, j],
                                 sample["timesteps"][:, j],
                                 embeds,
+                                added_cond_kwargs=unet_added_conditions,
                             ).sample
                         # compute the log prob of next_latents given latents under the current model
                         _, log_prob = ddim_step_with_logprob(
@@ -1031,7 +1050,7 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                         # backward pass
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                            accelerator.clip_grad_norm_(unet.parameters(), training_config.max_grad_norm)
                         optimizer.step()
                         optimizer.zero_grad()
 
@@ -1039,7 +1058,7 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                     if accelerator.sync_gradients:
                         assert (j == num_timesteps - 1) and (
                             i + 1
-                        ) % config.train.gradient_accumulation_steps == 0
+                        ) % training_config.gradient_accumulation_steps == 0
                         # log training-related stuff
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                         info = accelerator.reduce(info, reduction="mean")
