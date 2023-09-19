@@ -13,7 +13,7 @@ def get_config():
     config.logdir = "logs"
     # number of epochs to train for. each epoch is one round of sampling from the model followed by training on those
     # samples.
-    config.num_epochs = 100
+    config.num_epochs = 150
     # number of epochs between saving model checkpoints.
     config.save_freq = 20
     # number of checkpoints to keep before overwriting old ones.
@@ -30,26 +30,27 @@ def get_config():
     # attention layers of the UNet. with LoRA, fp16, and a batch size of 1, finetuning Stable Diffusion should take
     # about 10GB of GPU memory. beware that if LoRA is disabled, training will take a lot of memory and saved checkpoint
     # files will also be large.
-    config.use_lora = True
+    config.lora_rank = 8
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
     # base model to load. either a path to a local directory, or a model name from the HuggingFace model hub.
-    pretrained.model = "runwayml/stable-diffusion-v1-5"
+    pretrained.model = "stabilityai/stable-diffusion-xl-base-1.0"
+    #pretrained.model = "runwayml/stable-diffusion-v1-5"
     # revision of the model to load.
     pretrained.revision = "main"
 
     ###### Sampling ######
     config.sample = sample = ml_collections.ConfigDict()
     # number of sampler inference steps.
-    sample.num_steps = 50
+    sample.num_steps = 25
     # eta parameter for the DDIM sampler. this controls the amount of noise injected into the sampling process, with 0.0
     # being fully deterministic and 1.0 being equivalent to the DDPM sampler.
     sample.eta = 1.0
     # classifier-free guidance weight. 1.0 is no guidance.
     sample.guidance_scale = 5.0
     # batch size (per GPU!) to use for sampling.
-    sample.batch_size = 1
+    sample.batch_size = 8
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
     sample.num_batches_per_epoch = 2
@@ -59,7 +60,7 @@ def get_config():
     # batch size (per GPU!) to use for training.
     train.batch_size = 1
     # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = False
+    train.use_8bit_adam = True
     # learning rate.
     train.learning_rate = 3e-4
     # Adam beta1.
@@ -72,7 +73,7 @@ def get_config():
     train.adam_epsilon = 1e-8
     # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
     # gradient_accumulation_steps`.
-    train.gradient_accumulation_steps = 1
+    train.gradient_accumulation_steps = 8
     # maximum gradient norm for gradient clipping.
     train.max_grad_norm = 1.0
     # number of inner epochs per outer epoch. each inner epoch is one iteration through the data collected during one
@@ -91,13 +92,13 @@ def get_config():
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "imagenet_animals"
+    config.prompt_fn = "paintings"
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 
     ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
-    config.reward_fn = "jpeg_compressibility"
+    config.reward_fn = "hpsv2_score"
 
     ###### Per-Prompt Stat Tracking ######
     # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute
