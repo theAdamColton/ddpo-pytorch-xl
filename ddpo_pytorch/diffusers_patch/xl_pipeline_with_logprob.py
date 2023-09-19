@@ -43,7 +43,6 @@ def xl_pipeline_with_logprob(
     pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
     negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
     output_type: Optional[str] = "pil",
-    return_dict: bool = True,
     callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
     callback_steps: int = 1,
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -127,9 +126,6 @@ def xl_pipeline_with_logprob(
         output_type (`str`, *optional*, defaults to `"pil"`):
             The output format of the generate image. Choose between
             [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
-        return_dict (`bool`, *optional*, defaults to `True`):
-            Whether or not to return a [`~pipelines.stable_diffusion_xl.StableDiffusionXLPipelineOutput`] instead
-            of a plain tuple.
         callback (`Callable`, *optional*):
             A function that will be called every `callback_steps` steps during inference. The function will be
             called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
@@ -175,12 +171,6 @@ def xl_pipeline_with_logprob(
             [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
             information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
 
-    Examples:
-
-    Returns:
-        [`~pipelines.stable_diffusion_xl.StableDiffusionXLPipelineOutput`] or `tuple`:
-        [`~pipelines.stable_diffusion_xl.StableDiffusionXLPipelineOutput`] if `return_dict` is True, otherwise a
-        `tuple`. When returning a tuple, the first element is a list with the generated images.
     """
     # 0. Default height and width to unet
     height = height or self.default_sample_size * self.vae_scale_factor
@@ -333,7 +323,7 @@ def xl_pipeline_with_logprob(
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents, log_prob = ddim_step_with_logprob(self.scheduler, noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+            latents, log_prob = ddim_step_with_logprob(self.scheduler, noise_pred, t, latents, **extra_step_kwargs)
 
             all_latents.append(latents)
             all_log_probs.append(log_prob)
