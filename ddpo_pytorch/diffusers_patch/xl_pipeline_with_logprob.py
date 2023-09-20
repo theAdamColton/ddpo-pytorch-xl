@@ -323,7 +323,7 @@ def xl_pipeline_with_logprob(
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents, log_prob = ddim_step_with_logprob(self.scheduler, noise_pred, t, latents, **extra_step_kwargs)
+            latents, log_prob = ddim_step_with_logprob(self=self.scheduler, model_output=noise_pred, timestep=t, sample=latents, **extra_step_kwargs)
 
             all_latents.append(latents)
             all_log_probs.append(log_prob)

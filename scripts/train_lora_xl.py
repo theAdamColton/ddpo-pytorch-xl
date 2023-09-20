@@ -38,8 +38,10 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
 import diffusers
+import tomesd
 from diffusers import (
     DDIMScheduler,
+    DDPMScheduler,
     AutoencoderKL,
     DDPMScheduler,
     StableDiffusionXLPipeline,
@@ -136,7 +138,7 @@ class DatasetConfig:
 @dataclass
 class TrainingConfig:
     output_dir: str = field(
-        default="sd-model-finetuned-lora",
+        default="sd-model-finetuned-lora/",
         metadata={
             "help": "The output directory where the model predictions and checkpoints will be written."
         },
@@ -187,7 +189,7 @@ class TrainingConfig:
         },
     )
     learning_rate: float = field(
-        default=1e-4,
+        default=3e-4,
         metadata={
             "help": "Initial learning rate (after the potential warmup period) to use."
         },
@@ -262,7 +264,7 @@ class TrainingConfig:
         },
     )
     report_to: str = field(
-        default="tensorboard",
+        default="wandb",
         metadata={
             "help": 'The integration to report the results and logs to. Supported platforms are `"tensorboard"` (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         },
@@ -284,12 +286,6 @@ class TrainingConfig:
         default=False,
         metadata={
             "help": "Whether or not to use xformers.",
-        },
-    )
-    noise_offset: float = field(
-        default=0,
-        metadata={
-            "help": "The scale of noise offset.",
         },
     )
     rank: int = field(
@@ -314,7 +310,7 @@ class TrainingConfig:
         },
     )
     sample_guidance_scale: float = field(
-        default=6.5, metadata={"help": "cfg param for sampling phase"}
+        default=5.0, metadata={"help": "cfg param for sampling phase"}
     )
     sample_eta: float = field(
         default=1.0,
@@ -380,28 +376,22 @@ def tokenize_prompt(tokenizer, prompt):
 def encode_prompt(text_encoders, tokenizers, prompts, ):
     prompt_embeds_list = []
     pooled_prompt_embeds=None
-    bs_embed = None
 
     for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-        inputs = tokenize_prompt(tokenizer, prompts)
-        inputs = {k:v.to(text_encoder.device) for k,v in inputs.items()}
+        input_ids = tokenize_prompt(tokenizer, prompts).input_ids
 
-        outputs = text_encoder(**inputs, output_hidden_states=True)
+        outputs = text_encoder(input_ids.to(text_encoder.device), output_hidden_states=True)
 
         # We are only ALWAYS interested in the pooled output of the final text encoder
         pooled_prompt_embeds = outputs[0]
 
         prompt_embeds = outputs.hidden_states[-2]
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
         prompt_embeds_list.append(prompt_embeds)
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
 
     assert pooled_prompt_embeds is not None
-    assert bs_embed is not None
 
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return prompt_embeds, pooled_prompt_embeds
 
 
@@ -480,18 +470,30 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
         model_config.pretrained_model_name_or_path, model_config.revision, subfolder="text_encoder_2"
     )
 
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     # Load scheduler and models
-    noise_scheduler = DDIMScheduler.from_pretrained(
+    noise_scheduler = DDPMScheduler.from_pretrained(
         model_config.pretrained_model_name_or_path, subfolder="scheduler"
     )
+    noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
+
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         model_config.pretrained_model_name_or_path,
         subfolder="text_encoder",
+        torch_dtype=weight_dtype,
         revision=model_config.revision,
     )
     text_encoder_two = text_encoder_cls_two.from_pretrained(
         model_config.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
+        torch_dtype=weight_dtype,
         revision=model_config.revision,
     )
     vae_path = (
@@ -503,10 +505,13 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
         vae_path,
         subfolder="vae" if model_config.pretrained_vae_model_name_or_path is None else None,
         revision=model_config.revision,
+        torch_dtype=weight_dtype,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        model_config.pretrained_model_name_or_path, subfolder="unet", revision=model_config.revision
+        model_config.pretrained_model_name_or_path, subfolder="unet", revision=model_config.revision,
+        torch_dtype=weight_dtype,
     )
+    tomesd.apply_patch(unet, ratio=0.5)
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
@@ -514,13 +519,6 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     # The VAE is in float32 to avoid NaN losses.
@@ -580,34 +578,6 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
         unet_lora_parameters.extend(module.parameters())
 
     unet.set_attn_processor(unet_lora_attn_procs)
-
-    def compute_snr(timesteps):
-        """
-        Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
-        """
-        alphas_cumprod = noise_scheduler.alphas_cumprod
-        sqrt_alphas_cumprod = alphas_cumprod**0.5
-        sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
-
-        # Expand the tensors.
-        # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
-        sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[
-            timesteps
-        ].float()
-        while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
-            sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
-        alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
-
-        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(
-            device=timesteps.device
-        )[timesteps].float()
-        while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
-            sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
-        sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
-
-        # Compute SNR.
-        snr = (alpha / sigma) ** 2
-        return snr
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -747,7 +717,7 @@ def main(model_config: ModelConfig, dataset_config: DatasetConfig, training_conf
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(training_config))
+        accelerator.init_trackers("ddpo-sdxl-fine-tune", config=vars(training_config))
 
     samples_per_epoch = training_config.sample_batch_size * accelerator.num_processes * training_config.sample_num_batches_per_epoch
     total_train_batch_size = (
@@ -826,21 +796,19 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
         #################### SAMPLING ####################
         unet.eval()
         samples = []
-        last_images = []
-        last_rewards = None
-        last_prompts = []
 
         # TODO should this be constructed in the inner loop or is this slow?
         print("creating pipeline...")
         pipeline = StableDiffusionXLPipeline(
                 vae = vae,
-                text_encoder=text_encoder_two,
+                text_encoder=text_encoder_one,
                 text_encoder_2=text_encoder_two,
                 tokenizer=tokenizer_one,
                 tokenizer_2=tokenizer_two,
                 unet=unet,
                 scheduler=noise_scheduler,
-            )
+            ).to(accelerator.device)
+
         print("done creating pipeline.")
 
         # sample negative prompt embeddings
@@ -857,8 +825,6 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
 
             prompts = train_dataset.shuffle()['caption'][:training_config.sample_batch_size]
 
-            last_prompts = prompts
-
             # encode prompts
             prompt_embeds, pooled_prompt_embeds = encode_prompt(
                 text_encoders=[text_encoder_one, text_encoder_two],
@@ -868,6 +834,8 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
 
             images, latents, log_probs = xl_pipeline_with_logprob(
                     pipeline,
+                    #prompt = prompts,
+                    #negative_prompt = [""] * len(prompts),
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     negative_prompt_embeds=neg_prompt_embeds_sampling,
@@ -880,16 +848,13 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                     width=training_config.resolution,
                 )
 
-            last_images = images
 
             latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            timesteps = pipeline.scheduler.timesteps.repeat(training_config.sample_batch_size, 1)  # (batch_size, num_steps)
+            timesteps = pipeline.scheduler.timesteps.repeat(training_config.sample_batch_size, 1)
 
             rewards, _ = reward_fn(images, prompts, {})
             rewards = torch.as_tensor(rewards, device=accelerator.device)
-
-            last_rewards = rewards
 
             samples.append(
                 {
@@ -909,7 +874,7 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
         # Save generated images
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i, image in enumerate(last_images):
+            for i, image in enumerate(images):
                 pil = Image.fromarray((image.cpu().to(torch.float32).numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
             if training_config.report_to == "wandb":
@@ -917,7 +882,7 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
                     {
                         "images": [
                             wandb.Image(os.path.join(tmpdir, f"{i}.jpg"), caption=f"{prompt} | {reward:.2f}")
-                            for i, (prompt, reward) in enumerate(zip(last_prompts, last_rewards))  # only log rewards from process 0
+                            for i, (prompt, reward) in enumerate(zip(prompts, rewards))  # only log rewards from process 0
                         ],
                     },
                     step=global_step,
@@ -942,8 +907,14 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
         )
 
         # TODO reduce memory (is this enede?)
+
         pipeline = None
+        text_encoder_one = text_encoder_one.to('cpu')
+        text_encoder_two = text_encoder_two.to('cpu')
+        vae = vae.to('cpu')
         del samples["rewards"]
+
+        torch.cuda.empty_cache()
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert total_batch_size == training_config.sample_batch_size * training_config.sample_num_batches_per_epoch
@@ -1069,10 +1040,12 @@ f"Checkpoint '{training_config.resume_from_checkpoint}' does not exist. "
 
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
+            torch.cuda.empty_cache()
 
         if epoch != 0 and epoch % training_config.checkpointing_steps == 0 and accelerator.is_main_process:
-            accelerator.save_state()
+            accelerator.save_state(training_config.output_dir)
 
+        torch.cuda.empty_cache()
 
     # Save the lora layers
     accelerator.wait_for_everyone()

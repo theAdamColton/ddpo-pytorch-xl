@@ -8,29 +8,31 @@ def hpsv2_score():
     # can be installed from https://github.com/tgxs002/HPSv2
     from transformers import CLIPProcessor, CLIPModel
 
-    clip = CLIPModel.from_pretrained("adams-story/HPSv2-hf").to(torch.float16).to('cuda')
+    clip = CLIPModel.from_pretrained("adams-story/HPSv2-hf").to(torch.float16)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
     def _fn(images, prompts, _):
+        _this_clip = clip.to('cuda')
+
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
             images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
 
         images = [Image.fromarray(image) for image in images]
         inputs = processor(images=images, text=prompts, return_tensors='pt', padding=True)
-        inputs = {k:v.to(clip.device) for k,v in inputs.items()}
-
+        inputs = {k:v.to(_this_clip.device) for k,v in inputs.items()}
         with torch.no_grad():
-            image_features = clip.get_image_features(pixel_values=inputs['pixel_values'])
+            image_features = _this_clip.get_image_features(pixel_values=inputs['pixel_values'])
             image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
 
             del inputs['pixel_values']
 
-            text_features = clip.get_text_features(**inputs)
+            text_features = _this_clip.get_text_features(**inputs)
             text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
 
             scores = (image_features * text_features).sum(dim=-1)
 
+        _this_clip = None
         return scores, {}
 
     return _fn
